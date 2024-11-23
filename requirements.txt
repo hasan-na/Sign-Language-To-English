@@ -1,0 +1,12 @@
+pytube 
+yt-dlp
+opencv-python 
+torch 
+torchvision 
+transformers 
+pandas 
+numpy 
+matplotlib 
+albumentations 
+scikit-learn 
+mediapipe
