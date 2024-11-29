@@ -3,6 +3,9 @@ import ffmpeg # type: ignore
 import json
 import os
 
+# Add ffmpeg to the PATH
+os.environ["PATH"] += os.pathsep + r"C:\ffmpeg-master-latest-win64-gpl\bin"
+
 #load JSON file
 def load_json(file_path: str) -> dict:
     with open(file_path, 'r') as f:
@@ -28,13 +31,13 @@ def create_file_mapping(json_data, video_folder):
             print(f"Warning: No match found for {normalized_file}")
     return mapping
 
-def clip_video(video_path, start_time, end_time, save_path, label):
+def clip_video(video_path, start_time, end_time, save_path):
     try:
         (
             ffmpeg
             .input(video_path, ss=start_time, to=end_time)
             .output(save_path + '.mp4')
-            .run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+            .run(overwrite_output=True)
         )
         print(f"Clipped: {video_path} to {save_path}")
     except ffmpeg.Error as e:
@@ -53,9 +56,9 @@ def process_video(video_path, output_path, mapping, json_data):
         combined_video_path = os.path.join(video_path, video)
         start_time = item['start_time']
         end_time = item['end_time']
-        label = item.get('clean_text') 
-        combined_output_path = os.path.join(output_path, label) 
-        clip_video(combined_video_path, start_time, end_time, combined_output_path, label)
+        file_name = item['file']
+        combined_output_path = os.path.join(output_path, file_name) 
+        clip_video(combined_video_path, start_time, end_time, combined_output_path)
 
 def main():        
     train_json = load_json('MS-ASL/MSASL_train.json')

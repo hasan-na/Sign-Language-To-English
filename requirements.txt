@@ -11,3 +11,4 @@ albumentations
 scikit-learn 
 mediapipe
 ffmpeg-python
+pytorchvideo
