@@ -9,12 +9,9 @@ import cv2 # type: ignore
 import pandas as pd # type: ignore
 from torchvision import transforms # type: ignore
 from torch.utils.data import Dataset, DataLoader # type: ignore
-from pytorchvideo.models.head import create_res_basic_head # type: ignore
-from pytorchvideo.models.resnet import create_resnet # type: ignore
 from torchmetrics.classification import MulticlassPrecision, MulticlassRecall, MulticlassF1Score # type: ignore
-
-# Enable CUDA launch blocking
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+from torch.optim.lr_scheduler import ReduceLROnPlateau # type: ignore
+from torch.amp import autocast, GradScaler # type: ignore
 
 """Declare Constants"""
 MEAN = [0.485, 0.456, 0.406]
@@ -47,7 +44,7 @@ def uniform_frame_sampling(video_path, num_frames):
     return frames
 
 class VideoDataset(Dataset):   
-    def __init__(self, video_folder, json_data, transform=None, num_frames=5):
+    def __init__(self, video_folder, json_data, transform=None, num_frames=40):
         self.video_folder = video_folder
         self.transform = transform
         self.videos = [f for f in os.listdir(video_folder)]
@@ -122,6 +119,7 @@ def main():
 
     train_transform = Transformations(MEAN, STD, HEIGHT, WIDTH, train=True)
     test_transform = Transformations(MEAN, STD, HEIGHT, WIDTH, train=False)
+    val_transform = Transformations(MEAN, STD, HEIGHT, WIDTH, train=False)
 
     train_json = load_json('MS-ASL/MSASL_train.json')
     test_json = load_json('MS-ASL/MSASL_test.json')
@@ -129,33 +127,29 @@ def main():
 
     train_dataset = VideoDataset(train_video_folder, train_json, transform=train_transform)
     test_dataset = VideoDataset(test_video_folder, test_json,  transform=test_transform)
+    val_dataset = VideoDataset(val_video_folder, val_json,  transform=val_transform)
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = create_resnet(
-    input_channel=3,   
-    model_depth=50,    
-    model_num_class=1000,  
-    norm=nn.BatchNorm3d,
-    activation=nn.ReLU,
-)
-    model.blocks[-1] = create_res_basic_head(
-    in_features=model.blocks[-1].proj.in_features,
-    out_features=1000  
-    )
+    model = torch.hub.load('facebookresearch/pytorchvideo', 'slowfast_r50', pretrained=True)
+    model.blocks[6].proj = nn.Linear(model.blocks[6].proj.in_features, 1000)
     model.to(device)
 
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=0.001 * 2, weight_decay=0.02)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10)
+    optimizer = optim.SGD(model.parameters(), lr=0.001, weight_decay=0.001, momentum=0.9)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, min_lr=1e-5)
 
     precision_metric = MulticlassPrecision(num_classes=1000, average='macro').to(device)
     recall_metric = MulticlassRecall(num_classes=1000, average='macro').to(device)
     f1_metric = MulticlassF1Score(num_classes=1000, average='macro').to(device)
 
+    best_accuracy = 0.0
+    os.makedirs('saved_models', exist_ok=True)
+    MODEL_PATH = os.path.join('saved_models', 'slowfast_best_model.pth')
 
     for epoch in range(NUM_EPOCHS):
         print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
@@ -169,21 +163,34 @@ def main():
         running_loss = 0.0
         correct = 0
         total = 0
-
+        scaler = GradScaler()
         for frames, labels in train_loader:
             if (labels == -1).any():
                 print("Skipping batch")  
-                continue  
+                continue
+
             frames = frames.to(device)
             labels = labels.to(device)
 
-            optimizer.zero_grad()
-            outputs = model(frames)
-            _, predicted = torch.max(outputs.data, 1)
-            loss = loss_fn(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            slow_frames = frames[:, :, :8, :, :]  
+            fast_frames = frames[:, :, 8:, :, :]
 
+            slow_frames = slow_frames.to(device)
+            fast_frames = fast_frames.to(device)  
+            frames_input = [slow_frames, fast_frames]
+
+            optimizer.zero_grad()
+
+            with autocast(device_type = device.type):
+                outputs = model(frames_input)
+                loss = loss_fn(outputs, labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+            _, predicted = torch.max(outputs.data, 1)
             running_loss += loss.item()
             correct +=(labels==predicted).sum().item()
             total += labels.size(0)
@@ -192,7 +199,7 @@ def main():
             recall_metric.update(predicted, labels)
             f1_metric.update(predicted, labels)
 
-        scheduler.step()
+        
         epoch_precision = precision_metric.compute().item()
         epoch_recall = recall_metric.compute().item()
         epoch_f1 = f1_metric.compute().item()
@@ -202,17 +209,62 @@ def main():
 
         print(f"   - Training dataset. Accuracy: {epoch_acc:.3f}%, Precision: {epoch_precision:.3f}, Recall: {epoch_recall:.3f}, F1-Score: {epoch_f1:.3f}, Epoch loss: {epoch_loss:.3f}")
 
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
         model.eval()
         with torch.no_grad():
             correct = 0
             total = 0
-            for frames, labels in test_loader:
+            for frames, labels in val_loader:
+                if (labels == -1).any():
+                    print("Skipping batch")  
+                    continue
                 frames, labels = frames.to(device), labels.to(device)
-                outputs = model(frames)
+                slow_frames = frames[:, :, :8, :, :]  
+                fast_frames = frames[:, :, 8:, :, :]
+
+                slow_frames = slow_frames.to(device)
+                fast_frames = fast_frames.to(device)
+                frames_input = [slow_frames, fast_frames]
+                outputs = model(frames_input)
+                loss = loss_fn(outputs, labels)
+                val_loss += loss.item()
                 _, predicted = torch.max(outputs, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-            print(f'Epoch: {epoch+1}, Accuracy: {correct / total}')
+                val_correct += (predicted == labels).sum().item()
+                val_total += labels.size(0)
+        val_acc = 100.0 * val_correct / val_total    
+        print(f"Validation Loss: {val_loss/len(val_loader):.4f}, Accuracy: {val_acc:.2f}%")
+
+        if val_acc > best_accuracy:
+            best_accuracy = val_acc
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_accuracy': best_accuracy
+            }, MODEL_PATH)
+            print(f"Model saved at epoch {epoch + 1} with validation accuracy: {val_acc:.2f}%")
+    
+    print("\nFinal Test Set Evaluation:")
+    model.eval()
+    test_correct, test_total = 0, 0
+    with torch.no_grad():
+        for frames, labels in test_loader:
+            if (labels == -1).any():
+                print("Skipping batch")  
+                continue
+            frames, labels = frames.to(device), labels.to(device)
+            slow_frames, fast_frames = frames[:, :, :8, :, :], frames[:, :, 8:, :, :]
+            frames_input = [slow_frames.to(device), fast_frames.to(device)]
+
+            outputs = model(frames_input)
+            _, predicted = outputs.max(1)
+            test_correct += (predicted == labels).sum().item()
+            test_total += labels.size(0)
+
+    print(f"Test Accuracy: {100.0 * test_correct / test_total:.2f}%")
 
 
     
