@@ -44,7 +44,7 @@ def uniform_frame_sampling(video_path, num_frames):
     return frames
 
 class VideoDataset(Dataset):   
-    def __init__(self, video_folder, json_data, transform=None, num_frames=40):
+    def __init__(self, video_folder, json_data, transform=None, num_frames=20):
         self.video_folder = video_folder
         self.transform = transform
         self.videos = [f for f in os.listdir(video_folder)]
@@ -96,7 +96,9 @@ class Transformations:
             return transforms.Compose([
                 transforms.ToPILImage(),
                 transforms.Resize((self.height, self.width)),
-                transforms.RandomHorizontalFlip(),
+                transforms.RandomHorizontalFlip(p = 0.5),
+                transforms.RandomRotation(degrees=15),
+                transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
                 transforms.ToTensor(),
                 transforms.Normalize(self.mean, self.std)
             ])
@@ -129,27 +131,51 @@ def main():
     test_dataset = VideoDataset(test_video_folder, test_json,  transform=test_transform)
     val_dataset = VideoDataset(val_video_folder, val_json,  transform=val_transform)
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=6)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=6)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=6)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = torch.hub.load('facebookresearch/pytorchvideo', 'slowfast_r50', pretrained=True)
-    model.blocks[6].proj = nn.Linear(model.blocks[6].proj.in_features, 1000)
+    #model = torch.hub.load('facebookresearch/pytorchvideo', 'slowfast_r50', pretrained=True)
+    #model.blocks[6].proj = nn.Linear(model.blocks[6].proj.in_features, 1000)
+    model = torch.hub.load('facebookresearch/pytorchvideo', 'x3d_m', pretrained=True)
+    model.blocks[5].proj = nn.Linear(model.blocks[5].proj.in_features, 1000)
+    #print(model)
     model.to(device)
 
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.001, weight_decay=0.001, momentum=0.9)
-    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, min_lr=1e-5)
+    #optimizer = optim.SGD(model.parameters(), lr=0.001, weight_decay=0.00001, momentum=0.9)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.001, momentum=0.9)
+    #Could increase learning rate range
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    optimizer,
+    max_lr=0.001,
+    steps_per_epoch=len(train_loader),
+    epochs=NUM_EPOCHS,
+    anneal_strategy='cos',
+)
+
+    #could change factor to match assignment 1 ****IMP****
+    #scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, min_lr=1e-5)
+    
+    #scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=1e-5, max_lr=1e-3, step_size_up=10, mode='triangular2')
 
     precision_metric = MulticlassPrecision(num_classes=1000, average='macro').to(device)
     recall_metric = MulticlassRecall(num_classes=1000, average='macro').to(device)
     f1_metric = MulticlassF1Score(num_classes=1000, average='macro').to(device)
 
     best_accuracy = 0.0
+    accumulation_steps = 2
     os.makedirs('saved_models', exist_ok=True)
-    MODEL_PATH = os.path.join('saved_models', 'slowfast_best_model.pth')
+    MODEL_PATH = os.path.join('saved_models', 'x3d_best_model.pth')
+
+    if os.path.exists(MODEL_PATH):
+        print("Loading previously saved model...")
+        checkpoint = torch.load(MODEL_PATH, weights_only=True)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        best_accuracy = checkpoint['best_accuracy']
+        print(f"Resumed training with best validation accuracy: {best_accuracy:.2f}%")
 
     for epoch in range(NUM_EPOCHS):
         print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
@@ -164,34 +190,39 @@ def main():
         correct = 0
         total = 0
         scaler = GradScaler()
-        for frames, labels in train_loader:
+        optimizer.zero_grad()
+
+        for batch_idx, (frames, labels) in enumerate(train_loader):
             if (labels == -1).any():
-                print("Skipping batch")  
+                #print("Skipping batch")  
                 continue
 
             frames = frames.to(device)
             labels = labels.to(device)
 
-            slow_frames = frames[:, :, :8, :, :]  
-            fast_frames = frames[:, :, 8:, :, :]
+            #slow_frames = frames[:, :, :8, :, :]  
+            #fast_frames = frames[:, :, 8:, :, :]
 
-            slow_frames = slow_frames.to(device)
-            fast_frames = fast_frames.to(device)  
-            frames_input = [slow_frames, fast_frames]
-
-            optimizer.zero_grad()
+            #slow_frames = slow_frames.to(device)
+            #fast_frames = fast_frames.to(device)  
+            #frames_input = [slow_frames, fast_frames]
 
             with autocast(device_type = device.type):
-                outputs = model(frames_input)
-                loss = loss_fn(outputs, labels)
+                outputs = model(frames)
+                loss = loss_fn(outputs, labels) / accumulation_steps
 
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            running_loss += loss.item() * accumulation_steps
+
             scheduler.step()
 
+            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()  
+            
             _, predicted = torch.max(outputs.data, 1)
-            running_loss += loss.item()
+            
             correct +=(labels==predicted).sum().item()
             total += labels.size(0)
       
@@ -207,7 +238,7 @@ def main():
         epoch_loss = running_loss/len(train_loader)
         epoch_acc = 100.00* correct / total
 
-        print(f"   - Training dataset. Accuracy: {epoch_acc:.3f}%, Precision: {epoch_precision:.3f}, Recall: {epoch_recall:.3f}, F1-Score: {epoch_f1:.3f}, Epoch loss: {epoch_loss:.3f}")
+        print(f"Training dataset. Accuracy: {epoch_acc:.3f}%, Precision: {epoch_precision:.3f}, Recall: {epoch_recall:.3f}, F1-Score: {epoch_f1:.3f}, Epoch loss: {epoch_loss:.3f}")
 
         val_loss = 0.0
         val_correct = 0
@@ -218,23 +249,25 @@ def main():
             total = 0
             for frames, labels in val_loader:
                 if (labels == -1).any():
-                    print("Skipping batch")  
+                    #print("Skipping batch")  
                     continue
                 frames, labels = frames.to(device), labels.to(device)
-                slow_frames = frames[:, :, :8, :, :]  
-                fast_frames = frames[:, :, 8:, :, :]
+                #slow_frames = frames[:, :, :8, :, :]  
+                #fast_frames = frames[:, :, 8:, :, :]
 
-                slow_frames = slow_frames.to(device)
-                fast_frames = fast_frames.to(device)
-                frames_input = [slow_frames, fast_frames]
-                outputs = model(frames_input)
+                #slow_frames = slow_frames.to(device)
+                #fast_frames = fast_frames.to(device)
+                #frames_input = [slow_frames, fast_frames]
+                outputs = model(frames)
                 loss = loss_fn(outputs, labels)
                 val_loss += loss.item()
                 _, predicted = torch.max(outputs, 1)
                 val_correct += (predicted == labels).sum().item()
                 val_total += labels.size(0)
         val_acc = 100.0 * val_correct / val_total    
-        print(f"Validation Loss: {val_loss/len(val_loader):.4f}, Accuracy: {val_acc:.2f}%")
+        print(f"Validation Dataset. Accuracy: {val_acc:.2f}%, Validation Loss: {val_loss/len(val_loader):.4f} ")
+
+        #scheduler.step(val_loss)
 
         if val_acc > best_accuracy:
             best_accuracy = val_acc
@@ -256,10 +289,10 @@ def main():
                 print("Skipping batch")  
                 continue
             frames, labels = frames.to(device), labels.to(device)
-            slow_frames, fast_frames = frames[:, :, :8, :, :], frames[:, :, 8:, :, :]
-            frames_input = [slow_frames.to(device), fast_frames.to(device)]
+            #slow_frames, fast_frames = frames[:, :, :8, :, :], frames[:, :, 8:, :, :]
+            #frames_input = [slow_frames.to(device), fast_frames.to(device)]
 
-            outputs = model(frames_input)
+            outputs = model(frames)
             _, predicted = outputs.max(1)
             test_correct += (predicted == labels).sum().item()
             test_total += labels.size(0)
